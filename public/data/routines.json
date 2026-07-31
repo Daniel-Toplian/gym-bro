@@ -1,0 +1,18 @@
+[
+  {
+    "id": "upper-body-basics",
+    "name": "Upper body basics",
+    "exercises": [
+      {
+        "exerciseId": "push-up",
+        "sets": 3,
+        "restSeconds": 60
+      },
+      {
+        "exerciseId": "pull-up",
+        "sets": 3,
+        "restSeconds": 60
+      }
+    ]
+  }
+]

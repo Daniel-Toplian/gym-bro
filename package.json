@@ -1,0 +1,16 @@
+{
+  "name": "gym-bro",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run validate:data && vite build",
+    "preview": "vite preview",
+    "test": "node --test",
+    "validate:data": "node scripts/validate-data.js"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0"
+  }
+}
