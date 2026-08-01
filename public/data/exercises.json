@@ -1,10 +1,22 @@
 [
   {
     "id": "push-up",
-    "name": "Push-up"
+    "name": "Push-up",
+    "bodyParts": ["chest", "shoulders", "triceps"]
   },
   {
     "id": "pull-up",
-    "name": "Pull-up"
+    "name": "Pull-up",
+    "bodyParts": ["back", "biceps"]
+  },
+  {
+    "id": "dips",
+    "name": "Dips",
+    "bodyParts": ["chest", "shoulders", "triceps"]
+  },
+  {
+    "id": "squats",
+    "name": "Squats",
+    "bodyParts": ["quads", "glutes", "hamstrings"]
   }
 ]

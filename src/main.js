@@ -1,22 +1,43 @@
 import "./styles.css";
 import { DAYS, loadData, parseExerciseMedia } from "./data.js";
 import {
+  adjustRest,
   advanceWorkout,
   appendHistoryRecord,
   completeSet,
+  createFreeTimer,
   createHistoryRecord,
   createWorkout,
   endWorkout,
+  lastLoggedWeight,
+  freeTimerFinished,
+  freeTimerRunning,
+  freeTimerValueMs,
   loadDynamicState,
   newestHistoryFirst,
+  pauseFreeTimer,
   pauseWorkout,
+  removeHistoryRecord,
+  resetFreeTimer,
   restRemainingMs,
   resumeWorkout,
   saveDynamicState,
   skipExercise,
+  skipRest,
   skipSet,
+  startFreeTimer,
+  supersetGroup,
   workoutTimes,
 } from "./workout.js";
+import {
+  TRACKER_FIELDS,
+  addTrackerAmount,
+  clearTrackerDay,
+  pruneTrackerLog,
+  recentTrackerDays,
+  todayKey,
+  trackerTotals,
+} from "./trackers.js";
 
 const app = document.querySelector("#app");
 
@@ -32,6 +53,12 @@ function formatDay(day) {
 
 function formatRest(seconds) {
   return seconds === 60 ? "1 min rest" : `${seconds} sec rest`;
+}
+
+function formatEntryMeta(entry) {
+  const parts = [`${entry.sets} sets`, formatRest(entry.restSeconds)];
+  if (entry.weightKg !== undefined) parts.push(`${entry.weightKg} kg`);
+  return parts.join(" · ");
 }
 
 function formatDuration(milliseconds) {
@@ -51,23 +78,158 @@ function formatCompletedAt(timestamp) {
   }).format(new Date(timestamp));
 }
 
+const FREE_TIMER_PRESETS = [30, 60, 90];
+
+function renderFreeTimer(timer, now, open) {
+  const mode = timer?.mode ?? "stopwatch";
+  const running = timer ? freeTimerRunning(timer) : false;
+  const finished = timer ? freeTimerFinished(timer, now) : false;
+  const value = timer ? freeTimerValueMs(timer, now) : 0;
+  const idle = !timer || timer.startedAt === null;
+  const label = `${open ? "Close" : "Open"} timer${idle ? "" : `, ${formatDuration(value)}`}`;
+
+  return `
+    <div class="free-timer${finished ? " finished" : ""}">
+      <button
+        class="timer-button"
+        type="button"
+        data-timer-action="toggle-panel"
+        aria-expanded="${open}"
+        aria-controls="free-timer-panel"
+        aria-label="${escapeHtml(label)}"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="13" r="8" />
+          <path d="M12 9v4l2.5 2.5M9 2h6" />
+        </svg>
+      </button>
+      ${
+        idle
+          ? ""
+          : `<strong class="free-timer-value" data-timer="free" aria-hidden="true">${formatDuration(value)}</strong>`
+      }
+
+      <div class="free-timer-panel" id="free-timer-panel" role="group" aria-label="Free timer" ${open ? "" : "hidden"}>
+        <p class="nav-label">Timer</p>
+        <div class="free-timer-modes" role="group" aria-label="Timer mode">
+          ${["stopwatch", "countdown"]
+            .map(
+              (option) => `
+                <button
+                  class="mode-button"
+                  type="button"
+                  data-timer-action="mode"
+                  data-timer-mode="${option}"
+                  aria-pressed="${option === mode}"
+                >${option === "stopwatch" ? "Stopwatch" : "Countdown"}</button>
+              `,
+            )
+            .join("")}
+        </div>
+        <strong class="free-timer-panel-value" data-timer="free-panel" role="timer" aria-live="off">${formatDuration(value)}</strong>
+        ${
+          mode === "countdown"
+            ? `<div class="free-timer-presets">
+                ${FREE_TIMER_PRESETS.map(
+                  (seconds) => `
+                    <button class="secondary-button" type="button" data-timer-action="preset" data-timer-seconds="${seconds}">
+                      ${seconds}s
+                    </button>
+                  `,
+                ).join("")}
+                <label class="free-timer-custom">
+                  <span class="visually-hidden">Countdown seconds</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="14400"
+                    step="1"
+                    inputmode="numeric"
+                    placeholder="sec"
+                    data-timer-input="seconds"
+                  >
+                </label>
+                <button class="secondary-button" type="button" data-timer-action="custom">Set</button>
+              </div>`
+            : ""
+        }
+        <div class="free-timer-actions">
+          <button class="primary-button" type="button" data-timer-action="${running ? "pause" : "start"}">
+            ${running ? "Pause" : idle ? "Start" : "Resume"}
+          </button>
+          ${idle ? "" : `<button class="secondary-button" type="button" data-timer-action="reset">Reset</button>`}
+        </div>
+        <p class="free-timer-status" role="status">${finished ? "Countdown finished" : ""}</p>
+      </div>
+    </div>
+  `;
+}
+
+function renderBodyParts(exercise) {
+  return `
+    <ul class="body-parts" aria-label="Body parts worked">
+      ${exercise.bodyParts
+        .map((part) => `<li class="body-part-chip">${escapeHtml(part)}</li>`)
+        .join("")}
+    </ul>
+  `;
+}
+
+function routineBodyParts(routine, exerciseById) {
+  const parts = new Set();
+  routine.exercises.forEach((entry) => {
+    exerciseById.get(entry.exerciseId)?.bodyParts.forEach((part) => parts.add(part));
+  });
+  return [...parts];
+}
+
 function renderRoutineExercises(routine, exerciseById) {
   return routine.exercises
-    .map((entry) => {
+    .map((entry, entryIndex) => {
       const exercise = exerciseById.get(entry.exerciseId);
+      const members = supersetGroup(routine, entryIndex);
+      const grouped = members.length > 1;
+      const opensGroup = grouped && members[0] === entryIndex;
+      const closesGroup = grouped && members.at(-1) === entryIndex;
 
       return `
-        <li class="exercise-row">
-          <span>${escapeHtml(exercise.name)}</span>
-          <span class="exercise-meta">${entry.sets} sets · ${formatRest(entry.restSeconds)}</span>
+        ${opensGroup ? `<li class="superset-label" aria-hidden="true">Superset · ${members.length} exercises</li>` : ""}
+        <li class="exercise-row${grouped ? " superset-row" : ""}${closesGroup ? " superset-end" : ""}">
+          <div class="exercise-row-main">
+            <span>${escapeHtml(exercise.name)}</span>
+            ${renderBodyParts(exercise)}
+          </div>
+          <span class="exercise-meta">${formatEntryMeta(entry)}</span>
         </li>
       `;
     })
     .join("");
 }
 
-function renderWeekly(data, routineById, exerciseById) {
+function renderWeekDetail(day, routine, exerciseById) {
+  return `
+    <section class="week-detail" id="week-detail" aria-label="${escapeHtml(`${formatDay(day)} routine detail`)}">
+      <div class="week-detail-heading">
+        <div>
+          <p class="routine-label">${formatDay(day)}</p>
+          <h2>${escapeHtml(routine.name)}</h2>
+        </div>
+        <button class="text-button" type="button" data-expand-day="${escapeHtml(day)}">Close</button>
+      </div>
+      <ul class="exercise-list">
+        ${renderRoutineExercises(routine, exerciseById)}
+      </ul>
+      <button class="start-workout-button" type="button" data-start-routine="${escapeHtml(routine.id)}">
+        Start routine
+      </button>
+    </section>
+  `;
+}
+
+function renderWeekly(data, routineById, exerciseById, expandedDay) {
   const workoutCount = DAYS.filter((day) => data.schedule.days[day] !== null).length;
+  const expandedRoutineId = expandedDay ? data.schedule.days[expandedDay] : null;
+  const expandedRoutine = expandedRoutineId ? routineById.get(expandedRoutineId) : null;
 
   return `
     <section class="view-heading" aria-labelledby="weekly-title">
@@ -83,32 +245,55 @@ function renderWeekly(data, routineById, exerciseById) {
         if (!routine) {
           return `
             <li class="day-card rest-day">
-              <div class="day-card-heading">
-                <h2>${formatDay(day)}</h2>
+              <div class="day-head">
+                <span class="day-initial" aria-hidden="true">${formatDay(day).charAt(0)}</span>
+                <span class="day-dot" aria-hidden="true"></span>
+                <span class="day-name">${formatDay(day)}</span>
                 <span class="day-status">Rest</span>
               </div>
-              <p>Recovery day</p>
+              <p class="day-card-body">Recovery day</p>
             </li>
           `;
         }
 
+        const parts = routineBodyParts(routine, exerciseById);
+        const shown = parts.slice(0, 3);
+        const hidden = parts.length - shown.length;
+        const expanded = day === expandedDay;
+
         return `
-          <li class="day-card routine-day">
-            <div class="day-card-heading">
-              <h2>${formatDay(day)}</h2>
-              <span class="day-status">Workout</span>
-            </div>
-            <h3>${escapeHtml(routine.name)}</h3>
-            <ul class="exercise-list">
-              ${renderRoutineExercises(routine, exerciseById)}
-            </ul>
-            <button class="start-workout-button" type="button" data-start-routine="${escapeHtml(routine.id)}">
-              Start routine
+          <li class="day-card routine-day${expanded ? " day-expanded" : ""}">
+            <button
+              class="day-head"
+              type="button"
+              data-expand-day="${escapeHtml(day)}"
+              aria-expanded="${expanded}"
+              aria-controls="week-detail"
+              aria-label="${escapeHtml(`${formatDay(day)}, ${routine.name}. ${expanded ? "Hide" : "Show"} exercises`)}"
+            >
+              <span class="day-initial" aria-hidden="true">${formatDay(day).charAt(0)}</span>
+              <span class="day-dot" aria-hidden="true"></span>
+              <span class="day-name" aria-hidden="true">${formatDay(day)}</span>
+              <span class="day-status" aria-hidden="true">Workout</span>
             </button>
+            <div class="day-card-body">
+              <h3>${escapeHtml(routine.name)}</h3>
+              <p class="day-card-count">${routine.exercises.length} exercise${routine.exercises.length === 1 ? "" : "s"}</p>
+              <ul class="body-parts" aria-label="${escapeHtml(`Body parts worked: ${parts.join(", ")}`)}">
+                ${shown.map((part) => `<li class="body-part-chip">${escapeHtml(part)}</li>`).join("")}
+                ${hidden > 0 ? `<li class="body-part-chip muted-chip" aria-hidden="true">+${hidden}</li>` : ""}
+              </ul>
+              <div class="day-card-actions">
+                <button class="start-workout-button" type="button" data-start-routine="${escapeHtml(routine.id)}">
+                  Start routine
+                </button>
+              </div>
+            </div>
           </li>
         `;
       }).join("")}
     </ol>
+    ${expandedRoutine ? renderWeekDetail(expandedDay, expandedRoutine, exerciseById) : ""}
   `;
 }
 
@@ -188,30 +373,131 @@ function renderExerciseMedia(exercise) {
   return renderNoMedia();
 }
 
-function renderExercises(data) {
+function allBodyParts(exercises) {
+  return [...new Set(exercises.flatMap((exercise) => exercise.bodyParts))].sort();
+}
+
+function renderBodyPartFilters(exercises, selected) {
   return `
-    <section class="view-heading" aria-labelledby="exercises-title">
-      <p class="eyebrow">Library</p>
-      <h1 id="exercises-title">Exercises</h1>
-      <p>${data.exercises.length} configured exercise${data.exercises.length === 1 ? "" : "s"}, with guidance where available.</p>
-    </section>
-    <div class="exercise-grid">
-      ${data.exercises
+    <div class="body-part-filters" role="group" aria-label="Filter by body part">
+      <button
+        class="body-part-chip filter-chip"
+        type="button"
+        data-filter-body-part=""
+        aria-pressed="${selected.size === 0}"
+      >All</button>
+      ${allBodyParts(exercises)
         .map(
-          (exercise) => `
-            <article class="exercise-card">
-              <div class="exercise-card-heading">
-                <p class="routine-label">Exercise</p>
-                <h2>${escapeHtml(exercise.name)}</h2>
-              </div>
-              <div class="exercise-media">
-                ${renderExerciseMedia(exercise)}
-              </div>
-            </article>
+          (part) => `
+            <button
+              class="body-part-chip filter-chip"
+              type="button"
+              data-filter-body-part="${escapeHtml(part)}"
+              aria-pressed="${selected.has(part)}"
+            >${escapeHtml(part)}</button>
           `,
         )
         .join("")}
     </div>
+  `;
+}
+
+function renderExercises(data, selected) {
+  const visible =
+    selected.size === 0
+      ? data.exercises
+      : data.exercises.filter((exercise) => exercise.bodyParts.some((part) => selected.has(part)));
+
+  return `
+    <section class="view-heading" aria-labelledby="exercises-title">
+      <p class="eyebrow">Library</p>
+      <h1 id="exercises-title">Exercises</h1>
+      <p role="status">
+        ${
+          selected.size === 0
+            ? `${data.exercises.length} configured exercise${data.exercises.length === 1 ? "" : "s"}, with guidance where available.`
+            : `${visible.length} of ${data.exercises.length} exercises match the selected body parts.`
+        }
+      </p>
+    </section>
+    ${renderBodyPartFilters(data.exercises, selected)}
+    ${
+      visible.length === 0
+        ? `<section class="history-empty" aria-label="No matching exercises">
+            <h2>No exercises match</h2>
+            <p>Clear a body part or pick another to widen the search.</p>
+          </section>`
+        : `<div class="exercise-grid">
+            ${visible
+              .map(
+                (exercise) => `
+                  <article class="exercise-card">
+                    <div class="exercise-card-heading">
+                      <p class="routine-label">Exercise</p>
+                      <h2>${escapeHtml(exercise.name)}</h2>
+                      ${renderBodyParts(exercise)}
+                    </div>
+                    <div class="exercise-media">
+                      ${renderExerciseMedia(exercise)}
+                    </div>
+                  </article>
+                `,
+              )
+              .join("")}
+          </div>`
+    }
+  `;
+}
+
+function renderSupersetTrack(routine, exerciseById, exerciseIndex) {
+  const members = supersetGroup(routine, exerciseIndex);
+  if (members.length === 1) return "";
+
+  return `
+    <div class="superset-track" aria-label="Superset order">
+      <p class="routine-label">Superset</p>
+      <ol>
+        ${members
+          .map(
+            (index) => `
+              <li class="${index === exerciseIndex ? "superset-current" : ""}">
+                ${escapeHtml(exerciseById.get(routine.exercises[index].exerciseId).name)}
+              </li>
+            `,
+          )
+          .join("")}
+      </ol>
+    </div>
+  `;
+}
+
+function renderNextExercise(routine, exerciseById, exerciseIndex, setIndex) {
+  const members = supersetGroup(routine, exerciseIndex);
+  const position = members.indexOf(exerciseIndex);
+  const withinGroup = position < members.length - 1 ? members[position + 1] : null;
+  const lastRound = setIndex === routine.exercises[members[0]].sets - 1;
+  const nextRound = !lastRound ? members[0] : null;
+  const nextIndex = withinGroup ?? nextRound ?? members.at(-1) + 1;
+  const nextEntry = routine.exercises[nextIndex];
+
+  if (!nextEntry) {
+    return `
+      <aside class="next-exercise last-exercise" aria-label="Next exercise">
+        <p class="routine-label">Up next</p>
+        <p class="next-exercise-empty">Last exercise</p>
+      </aside>
+    `;
+  }
+
+  const nextExercise = exerciseById.get(nextEntry.exerciseId);
+
+  return `
+    <aside class="next-exercise" aria-label="Next exercise">
+      <p class="routine-label">Up next</p>
+      <h3>${escapeHtml(nextExercise.name)}</h3>
+      <p class="exercise-meta">${formatEntryMeta(nextEntry)}</p>
+      ${renderBodyParts(nextExercise)}
+    </aside>
   `;
 }
 
@@ -223,6 +509,10 @@ function renderActiveWorkout(workout, routine, exerciseById, now) {
   const paused = workout.pausedAt !== null;
   const completedSets = workout.setResults.filter((result) => result.status === "completed").length;
   const skippedSets = workout.setResults.filter((result) => result.status === "skipped").length;
+  const prefillWeight =
+    lastLoggedWeight(workout, workout.exerciseIndex) ?? routineEntry.weightKg ?? null;
+  const grouped = supersetGroup(routine, workout.exerciseIndex).length > 1;
+  const unit = grouped ? "round" : "set";
 
   return `
     <section class="active-workout" aria-labelledby="active-workout-title">
@@ -252,7 +542,9 @@ function renderActiveWorkout(workout, routine, exerciseById, now) {
         <div class="active-workout-panel">
           <p class="routine-label">Current exercise</p>
           <h2>${escapeHtml(exercise.name)}</h2>
-          <div class="set-progress" aria-label="Set progress">
+          ${renderBodyParts(exercise)}
+          ${renderSupersetTrack(routine, exerciseById, workout.exerciseIndex)}
+          <div class="set-progress" aria-label="${grouped ? "Round progress" : "Set progress"}">
             ${Array.from({ length: routineEntry.sets }, (_, setIndex) => {
               const result = workout.setResults.find(
                 (item) => item.exerciseIndex === workout.exerciseIndex && item.setIndex === setIndex,
@@ -265,14 +557,39 @@ function renderActiveWorkout(workout, routine, exerciseById, now) {
           ${
             resting
               ? `<div class="rest-countdown" role="timer" aria-live="polite">
-                  <span>Rest before set ${workout.setIndex + 1}</span>
+                  <span>Rest before ${unit} ${workout.setIndex + 1}</span>
                   <strong data-timer="rest">${Math.ceil(restRemainingMs(workout, now) / 1000)}</strong>
                   <small>seconds</small>
+                </div>
+                <div class="rest-controls">
+                  <button class="secondary-button" type="button" data-workout-action="rest-minus" ${paused ? "disabled" : ""}>&minus;15s</button>
+                  <button class="secondary-button" type="button" data-workout-action="rest-plus" ${paused ? "disabled" : ""}>+15s</button>
+                  <button class="primary-button" type="button" data-workout-action="skip-rest" ${paused ? "disabled" : ""}>Skip rest</button>
                 </div>`
               : `<div class="current-set">
-                  <span>Current set</span>
+                  <span>Current ${unit}</span>
                   <strong>${workout.setIndex + 1}<small> / ${routineEntry.sets}</small></strong>
                 </div>`
+          }
+
+          ${
+            resting
+              ? ""
+              : `<label class="set-weight">
+                  <span>Weight</span>
+                  <input
+                    type="number"
+                    min="0"
+                    max="1000"
+                    step="0.5"
+                    inputmode="decimal"
+                    placeholder="kg"
+                    value="${prefillWeight === null ? "" : prefillWeight}"
+                    data-workout-input="weight"
+                    ${paused ? "disabled" : ""}
+                  >
+                  <small>kg</small>
+                </label>`
           }
 
           <div class="workout-actions">
@@ -282,13 +599,12 @@ function renderActiveWorkout(workout, routine, exerciseById, now) {
                 : `<button class="primary-button" type="button" data-workout-action="complete-set" ${paused ? "disabled" : ""}>Complete set</button>
                    <button class="secondary-button" type="button" data-workout-action="skip-set" ${paused ? "disabled" : ""}>Skip set</button>`
             }
-            <button class="text-button" type="button" data-workout-action="skip-exercise" ${paused ? "disabled" : ""}>Skip exercise</button>
+            <button class="text-button" type="button" data-workout-action="skip-exercise" ${paused ? "disabled" : ""}>
+              ${grouped ? "Skip superset" : "Skip exercise"}
+            </button>
           </div>
           <p class="workout-result-counts">${completedSets} completed · ${skippedSets} skipped</p>
-        </div>
-
-        <div class="exercise-media active-exercise-media">
-          ${renderExerciseMedia(exercise)}
+          ${renderNextExercise(routine, exerciseById, workout.exerciseIndex, workout.setIndex)}
         </div>
       </div>
 
@@ -304,7 +620,11 @@ function renderSessionExercises(session) {
         <li class="history-exercise">
           <div>
             <strong>${escapeHtml(exercise.exerciseName)}</strong>
-            <span>${exercise.completedSets} completed · ${exercise.skippedSets} skipped</span>
+            <span>
+              ${exercise.completedSets} completed · ${exercise.skippedSets} skipped${
+                exercise.topWeightKg === null ? "" : ` · top ${exercise.topWeightKg} kg`
+              }
+            </span>
           </div>
           <time>${formatDuration(exercise.durationMs)}</time>
         </li>
@@ -358,7 +678,14 @@ function renderHistory(history) {
                           <h2>${escapeHtml(session.routineName)}</h2>
                           <time datetime="${new Date(session.completedAt).toISOString()}">${escapeHtml(formatCompletedAt(session.completedAt))}</time>
                         </div>
-                        <strong>${formatDuration(session.durationMs)}</strong>
+                        <div class="history-card-aside">
+                          <strong>${formatDuration(session.durationMs)}</strong>
+                          <button
+                            class="text-button"
+                            type="button"
+                            data-delete-history="${escapeHtml(session.id)}"
+                          >Delete</button>
+                        </div>
                       </div>
                       <p class="history-counts">${session.completedSets} completed · ${session.skippedSets} skipped</p>
                       <ul class="history-exercises">
@@ -374,9 +701,129 @@ function renderHistory(history) {
   `;
 }
 
+const TRACKER_META = {
+  calories: {
+    label: "Calories",
+    unit: "kcal",
+    quickAdds: [100, 250, 500],
+    inputLabel: "Calories to add",
+  },
+  protein: {
+    label: "Protein",
+    unit: "g",
+    quickAdds: [20, 30, 50],
+    inputLabel: "Grams of protein to add",
+  },
+  waterMl: {
+    label: "Water",
+    unit: "ml",
+    quickAdds: [250, 500, 750],
+    inputLabel: "Millilitres to add",
+  },
+};
+
+function renderTrackerTrend(days, field, goal) {
+  return `
+    <ol class="tracker-trend" aria-label="Last 7 days">
+      ${days
+        .map((day) => {
+          const percent = Math.min(100, Math.round((day[field] / goal) * 100));
+          return `
+            <li>
+              <span class="tracker-bar" style="--fill: ${percent}%" aria-hidden="true"></span>
+              <span class="tracker-bar-label">${escapeHtml(day.dateKey.slice(8))}</span>
+              <span class="visually-hidden">${day.dateKey}: ${day[field]}</span>
+            </li>
+          `;
+        })
+        .join("")}
+    </ol>
+  `;
+}
+
+function renderTrackerCard(field, total, goal, days) {
+  const meta = TRACKER_META[field];
+  const percent = Math.min(100, Math.round((total / goal) * 100));
+
+  return `
+    <article class="tracker-card">
+      <div class="tracker-card-heading">
+        <div>
+          <p class="routine-label">${meta.label}</p>
+          <strong>${total}<small> / ${goal} ${meta.unit}</small></strong>
+        </div>
+        <span class="tracker-percent">${percent}%</span>
+      </div>
+      <div
+        class="tracker-meter"
+        role="progressbar"
+        aria-valuenow="${total}"
+        aria-valuemin="0"
+        aria-valuemax="${goal}"
+        aria-label="${escapeHtml(`${meta.label} against today's goal`)}"
+      >
+        <span style="--fill: ${percent}%"></span>
+      </div>
+      <div class="tracker-actions">
+        ${meta.quickAdds
+          .map(
+            (amount) => `
+              <button
+                class="secondary-button"
+                type="button"
+                data-tracker-action="add"
+                data-tracker-field="${field}"
+                data-tracker-amount="${amount}"
+              >+${amount}</button>
+            `,
+          )
+          .join("")}
+      </div>
+      <div class="tracker-custom">
+        <label>
+          <span class="visually-hidden">${meta.inputLabel}</span>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            inputmode="numeric"
+            placeholder="${meta.unit}"
+            data-tracker-input="${field}"
+          >
+        </label>
+        <button class="text-button" type="button" data-tracker-action="add-custom" data-tracker-field="${field}">
+          Add
+        </button>
+      </div>
+      ${renderTrackerTrend(days, field, goal)}
+    </article>
+  `;
+}
+
+function renderTrackers(dynamicState, now) {
+  const dateKey = todayKey(now);
+  const totals = trackerTotals(dynamicState.dailyTotals, dateKey);
+  const days = recentTrackerDays(dynamicState.dailyTotals, dateKey, 7);
+  const goals = dynamicState.trackerGoals;
+
+  return `
+    <section class="view-heading" aria-labelledby="trackers-title">
+      <p class="eyebrow">Today</p>
+      <h1 id="trackers-title">Trackers</h1>
+      <p>Calories, protein and water logged for ${escapeHtml(dateKey)}, against your daily goals.</p>
+    </section>
+    <div class="tracker-grid">
+      ${TRACKER_FIELDS.map((field) =>
+        renderTrackerCard(field, totals[field], goals[field], days),
+      ).join("")}
+    </div>
+    <button class="text-button" type="button" data-tracker-action="reset">Reset today</button>
+  `;
+}
+
 function currentView() {
   const view = window.location.hash.slice(1);
-  return ["weekly", "routines", "exercises", "history", "active"].includes(view)
+  return ["weekly", "routines", "exercises", "trackers", "history", "active"].includes(view)
     ? view
     : "weekly";
 }
@@ -386,6 +833,9 @@ function renderShell(data) {
   const exerciseById = new Map(data.exercises.map((exercise) => [exercise.id, exercise]));
   let dynamicState = loadDynamicState(data.defaults, data.routines);
   let completionSummary = null;
+  let expandedDay = null;
+  let timerPanelOpen = false;
+  const selectedBodyParts = new Set();
 
   function persist() {
     try {
@@ -421,9 +871,11 @@ function renderShell(data) {
         <a href="#weekly" data-view="weekly">Weekly plan</a>
         <a href="#routines" data-view="routines">All routines</a>
         <a href="#exercises" data-view="exercises">Exercise library</a>
+        <a href="#trackers" data-view="trackers">Trackers</a>
         <a href="#history" data-view="history">History</a>
         <a href="#active" data-view="active" data-active-workout-link>Active routine</a>
       </nav>
+      <div class="free-timer-slot"></div>
     </header>
     <div class="menu-scrim" hidden></div>
     <main id="main-content" tabindex="-1"></main>
@@ -433,23 +885,48 @@ function renderShell(data) {
   const navigation = app.querySelector(".site-navigation");
   const scrim = app.querySelector(".menu-scrim");
   const main = app.querySelector("main");
+  const timerSlot = app.querySelector(".free-timer-slot");
+
+  function renderTimerBar() {
+    timerSlot.innerHTML = renderFreeTimer(dynamicState.freeTimer, Date.now(), timerPanelOpen);
+  }
+
+  function syncScrim() {
+    scrim.hidden = navigation.hidden && !timerPanelOpen;
+    document.body.classList.toggle("menu-open", !scrim.hidden);
+  }
+
+  function closeTimerPanel({ restoreFocus = false } = {}) {
+    if (!timerPanelOpen) return;
+    timerPanelOpen = false;
+    renderTimerBar();
+    syncScrim();
+    if (restoreFocus) timerSlot.querySelector(".timer-button").focus();
+  }
 
   function closeMenu({ restoreFocus = false } = {}) {
     navigation.hidden = true;
-    scrim.hidden = true;
     menuButton.setAttribute("aria-expanded", "false");
     menuButton.setAttribute("aria-label", "Open navigation");
-    document.body.classList.remove("menu-open");
+    syncScrim();
     if (restoreFocus) menuButton.focus();
   }
 
   function openMenu() {
+    closeTimerPanel();
     navigation.hidden = false;
-    scrim.hidden = false;
     menuButton.setAttribute("aria-expanded", "true");
     menuButton.setAttribute("aria-label", "Close navigation");
-    document.body.classList.add("menu-open");
+    syncScrim();
     navigation.querySelector("a").focus();
+  }
+
+  function openTimerPanel() {
+    closeMenu();
+    timerPanelOpen = true;
+    renderTimerBar();
+    syncScrim();
+    timerSlot.querySelector(".free-timer-panel button").focus();
   }
 
   function renderView({ focus = false } = {}) {
@@ -458,7 +935,9 @@ function renderShell(data) {
     if (view === "routines") {
       main.innerHTML = renderRoutines(data, exerciseById);
     } else if (view === "exercises") {
-      main.innerHTML = renderExercises(data);
+      main.innerHTML = renderExercises(data, selectedBodyParts);
+    } else if (view === "trackers") {
+      main.innerHTML = renderTrackers(dynamicState, Date.now());
     } else if (view === "history") {
       main.innerHTML = renderHistory(dynamicState.workoutHistory);
     } else if (view === "active" && dynamicState.activeWorkout) {
@@ -467,7 +946,7 @@ function renderShell(data) {
     } else if (view === "active" && completionSummary) {
       main.innerHTML = renderCompletion(completionSummary);
     } else {
-      main.innerHTML = renderWeekly(data, routineById, exerciseById);
+      main.innerHTML = renderWeekly(data, routineById, exerciseById, expandedDay);
     }
 
     const activeLink = app.querySelector("[data-active-workout-link]");
@@ -495,14 +974,125 @@ function renderShell(data) {
   navigation.addEventListener("click", (event) => {
     if (event.target.matches("a")) closeMenu();
   });
-  scrim.addEventListener("click", () => closeMenu({ restoreFocus: true }));
+  scrim.addEventListener("click", () => {
+    closeTimerPanel({ restoreFocus: true });
+    closeMenu({ restoreFocus: true });
+  });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && menuButton.getAttribute("aria-expanded") === "true") {
-      closeMenu({ restoreFocus: true });
-    }
+    if (event.key !== "Escape") return;
+    if (timerPanelOpen) closeTimerPanel({ restoreFocus: true });
+    if (menuButton.getAttribute("aria-expanded") === "true") closeMenu({ restoreFocus: true });
   });
   window.addEventListener("hashchange", () => renderView({ focus: true }));
+  timerSlot.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-timer-action]");
+    if (!button) return;
+
+    if (button.dataset.timerAction === "toggle-panel") {
+      if (timerPanelOpen) {
+        closeTimerPanel({ restoreFocus: true });
+      } else {
+        openTimerPanel();
+      }
+      return;
+    }
+
+    const now = Date.now();
+    const timer = dynamicState.freeTimer ?? createFreeTimer("stopwatch");
+    const action = button.dataset.timerAction;
+    let next = timer;
+
+    if (action === "mode") next = createFreeTimer(button.dataset.timerMode, timer.durationMs);
+    if (action === "preset") {
+      next = createFreeTimer("countdown", Number(button.dataset.timerSeconds) * 1000);
+    }
+    if (action === "custom") {
+      const seconds = Number(timerSlot.querySelector('[data-timer-input="seconds"]').value);
+      if (!Number.isFinite(seconds) || seconds <= 0) return;
+      next = createFreeTimer("countdown", seconds * 1000);
+    }
+    if (action === "start") next = startFreeTimer(timer, now);
+    if (action === "pause") next = pauseFreeTimer(timer, now);
+    if (action === "reset") next = resetFreeTimer(timer);
+
+    dynamicState = { ...dynamicState, freeTimer: next };
+    persist();
+    renderTimerBar();
+  });
   main.addEventListener("click", (event) => {
+    const filterChip = event.target.closest("[data-filter-body-part]");
+    if (filterChip) {
+      const part = filterChip.dataset.filterBodyPart;
+      if (part === "") {
+        selectedBodyParts.clear();
+      } else if (selectedBodyParts.has(part)) {
+        selectedBodyParts.delete(part);
+      } else {
+        selectedBodyParts.add(part);
+      }
+      renderView();
+      main.querySelector(`[data-filter-body-part="${CSS.escape(part)}"]`)?.focus();
+      return;
+    }
+
+    const trackerButton = event.target.closest("[data-tracker-action]");
+    if (trackerButton) {
+      const action = trackerButton.dataset.trackerAction;
+      const field = trackerButton.dataset.trackerField;
+      const dateKey = todayKey(Date.now());
+      let dailyTotals = dynamicState.dailyTotals;
+
+      if (action === "add") {
+        dailyTotals = addTrackerAmount(dailyTotals, dateKey, field, Number(trackerButton.dataset.trackerAmount));
+      }
+      if (action === "add-custom") {
+        const input = main.querySelector(`[data-tracker-input="${field}"]`);
+        const amount = Number(input.value);
+        if (!Number.isFinite(amount) || amount <= 0) return;
+        dailyTotals = addTrackerAmount(dailyTotals, dateKey, field, amount);
+      }
+      if (action === "reset") {
+        if (!window.confirm("Clear today's calorie and water totals?")) return;
+        dailyTotals = clearTrackerDay(dailyTotals, dateKey);
+      }
+
+      dynamicState = { ...dynamicState, dailyTotals: pruneTrackerLog(dailyTotals, dateKey) };
+      persist();
+      renderView();
+      return;
+    }
+
+    const deleteButton = event.target.closest("[data-delete-history]");
+    if (deleteButton) {
+      const id = deleteButton.dataset.deleteHistory;
+      const record = dynamicState.workoutHistory.find((item) => item.id === id);
+      if (!record) return;
+      if (
+        !window.confirm(
+          `Delete the ${record.routineName} session from ${formatCompletedAt(record.completedAt)}?`,
+        )
+      ) {
+        return;
+      }
+      dynamicState = {
+        ...dynamicState,
+        workoutHistory: removeHistoryRecord(dynamicState.workoutHistory, id),
+      };
+      persist();
+      renderView({ focus: true });
+      return;
+    }
+
+    const expandButton = event.target.closest("[data-expand-day]");
+    if (expandButton) {
+      const day = expandButton.dataset.expandDay;
+      expandedDay = expandedDay === day ? null : day;
+      renderView();
+      const reopened = main.querySelector(`[data-expand-day="${day}"]`);
+      if (reopened) reopened.focus();
+      return;
+    }
+
     const startButton = event.target.closest("[data-start-routine]");
     if (startButton) {
       const routine = routineById.get(startButton.dataset.startRoutine);
@@ -537,9 +1127,16 @@ function renderShell(data) {
     const action = actionButton.dataset.workoutAction;
     let result = { workout, completion: null };
 
-    if (action === "complete-set") result = completeSet(workout, routine, now);
+    if (action === "complete-set") {
+      const input = main.querySelector('[data-workout-input="weight"]');
+      const weight = input && input.value !== "" ? Number(input.value) : null;
+      result = completeSet(workout, routine, now, weight);
+    }
     if (action === "skip-set") result = skipSet(workout, routine, now);
     if (action === "skip-exercise") result = skipExercise(workout, routine, now);
+    if (action === "skip-rest") result = skipRest(workout);
+    if (action === "rest-minus") result = adjustRest(workout, now, -15_000);
+    if (action === "rest-plus") result = adjustRest(workout, now, 15_000);
     if (action === "pause") result.workout = pauseWorkout(workout, now);
     if (action === "resume") result.workout = resumeWorkout(workout, now);
     if (action === "end") {
@@ -572,8 +1169,24 @@ function renderShell(data) {
   );
 
   renderView();
+  renderTimerBar();
 
-  function updateTimers() {
+  function updateFreeTimer() {
+    const timer = dynamicState.freeTimer;
+    if (!timer || timer.startedAt === null) return;
+
+    const now = Date.now();
+    const text = formatDuration(freeTimerValueMs(timer, now));
+    timerSlot.querySelectorAll('[data-timer="free"], [data-timer="free-panel"]').forEach((value) => {
+      if (value.textContent !== text) value.textContent = text;
+    });
+
+    const bar = timerSlot.querySelector(".free-timer");
+    const finished = freeTimerFinished(timer, now);
+    if (bar && bar.classList.contains("finished") !== finished) renderTimerBar();
+  }
+
+  function updateWorkoutTimers() {
     if (currentView() !== "active" || !dynamicState.activeWorkout) return;
     const now = Date.now();
     const advanced = advanceWorkout(dynamicState.activeWorkout, now);
@@ -598,6 +1211,11 @@ function renderShell(data) {
       routineTimer.textContent = routineText;
     }
     if (restTimer && restTimer.textContent !== restText) restTimer.textContent = restText;
+  }
+
+  function updateTimers() {
+    updateFreeTimer();
+    updateWorkoutTimers();
   }
 
   window.setInterval(updateTimers, 250);

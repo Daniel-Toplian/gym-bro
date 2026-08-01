@@ -5,8 +5,8 @@ import { DAYS, parseExerciseMedia, validateData } from "../src/data.js";
 
 const seed = {
   exercises: [
-    { id: "push-up", name: "Push-up" },
-    { id: "pull-up", name: "Pull-up" },
+    { id: "push-up", name: "Push-up", bodyParts: ["chest", "shoulders", "triceps"] },
+    { id: "pull-up", name: "Pull-up", bodyParts: ["back", "biceps"] },
   ],
   routines: [
     {
@@ -38,6 +38,9 @@ const seed = {
       rest: null,
     },
     workoutHistory: [],
+    freeTimer: null,
+    dailyTotals: {},
+    trackerGoals: { calories: 2200, protein: 150, waterMl: 3000 },
   },
 };
 
@@ -49,10 +52,46 @@ test("accepts a complete workout data set", () => {
   assert.equal(validateData(clone(seed)).routines[0].name, "Basics");
 });
 
+test("requires every exercise to declare the body parts it works", () => {
+  const missing = clone(seed);
+  delete missing.exercises[0].bodyParts;
+  assert.throws(() => validateData(missing), /bodyParts must be a non-empty array/);
+
+  const empty = clone(seed);
+  empty.exercises[0].bodyParts = [];
+  assert.throws(() => validateData(empty), /bodyParts must be a non-empty array/);
+
+  const blank = clone(seed);
+  blank.exercises[0].bodyParts = ["chest", " "];
+  assert.throws(() => validateData(blank), /bodyParts must contain only non-empty strings/);
+
+  const duplicated = clone(seed);
+  duplicated.exercises[0].bodyParts = ["chest", "chest"];
+  assert.throws(() => validateData(duplicated), /bodyParts must not repeat a body part/);
+});
+
 test("rejects routine exercise references that do not exist", () => {
   const data = clone(seed);
   data.routines[0].exercises[0].exerciseId = "missing";
   assert.throws(() => validateData(data), /reference an existing exercise/);
+});
+
+test("target weight is optional but must be a sane number when present", () => {
+  const withWeight = clone(seed);
+  withWeight.routines[0].exercises[0].weightKg = 42.5;
+  assert.equal(validateData(withWeight).routines[0].exercises[0].weightKg, 42.5);
+
+  const negative = clone(seed);
+  negative.routines[0].exercises[0].weightKg = -1;
+  assert.throws(() => validateData(negative), /weightKg must be a number between 0 and 1000/);
+
+  const absurd = clone(seed);
+  absurd.routines[0].exercises[0].weightKg = 5000;
+  assert.throws(() => validateData(absurd), /weightKg must be a number between 0 and 1000/);
+
+  const notANumber = clone(seed);
+  notANumber.routines[0].exercises[0].weightKg = "heavy";
+  assert.throws(() => validateData(notANumber), /weightKg must be a number between 0 and 1000/);
 });
 
 test("rejects invalid set and rest values", () => {
@@ -63,6 +102,34 @@ test("rejects invalid set and rest values", () => {
   const invalidRest = clone(seed);
   invalidRest.routines[0].exercises[0].restSeconds = -1;
   assert.throws(() => validateData(invalidRest), /restSeconds must be a non-negative integer/);
+});
+
+test("superset groups must be consecutive, plural, and share a set count", () => {
+  const valid = clone(seed);
+  valid.routines[0].exercises[0].supersetGroup = "a";
+  valid.routines[0].exercises[1].supersetGroup = "a";
+  assert.equal(validateData(valid).routines[0].exercises[0].supersetGroup, "a");
+
+  const lonely = clone(seed);
+  lonely.routines[0].exercises[0].supersetGroup = "a";
+  assert.throws(() => validateData(lonely), /must contain at least two exercises/);
+
+  const mismatched = clone(valid);
+  mismatched.routines[0].exercises[1].sets = 5;
+  assert.throws(() => validateData(mismatched), /same number of sets/);
+
+  const split = clone(seed);
+  split.exercises.push({ id: "dips", name: "Dips", bodyParts: ["triceps"] });
+  split.routines[0].exercises = [
+    { exerciseId: "push-up", sets: 3, restSeconds: 60, supersetGroup: "a" },
+    { exerciseId: "dips", sets: 3, restSeconds: 60 },
+    { exerciseId: "pull-up", sets: 3, restSeconds: 60, supersetGroup: "a" },
+  ];
+  assert.throws(() => validateData(split), /must group consecutive exercises/);
+
+  const blank = clone(seed);
+  blank.routines[0].exercises[0].supersetGroup = "";
+  assert.throws(() => validateData(blank), /supersetGroup must be a non-empty string/);
 });
 
 test("requires exactly Sunday through Saturday in the schedule", () => {
@@ -130,5 +197,29 @@ test("history is reachable and renders snapshots without tracking disallowed det
   assert.match(source, /No workout history yet/);
   assert.match(source, /newestHistoryFirst\(history\)/);
   assert.match(source, /exercise\.exerciseName/);
-  assert.doesNotMatch(source, /data-(?:weight|reps|notes|delete|export)/i);
+  assert.doesNotMatch(source, /data-(?:reps|notes|export)/i);
+});
+
+test("weight is logged per set and surfaced in history", async () => {
+  const source = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+
+  assert.match(source, /data-workout-input="weight"/);
+  assert.match(source, /completeSet\(workout, routine, now, weight\)/);
+  assert.match(source, /exercise\.topWeightKg/);
+});
+
+test("the exercise library can be filtered by body part", async () => {
+  const source = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+
+  assert.match(source, /data-filter-body-part=/);
+  assert.match(source, /bodyParts\.some\(\(part\) => selected\.has\(part\)\)/);
+  assert.match(source, /No exercises match/);
+});
+
+test("history sessions can be removed individually", async () => {
+  const source = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+
+  assert.match(source, /data-delete-history=/);
+  assert.match(source, /removeHistoryRecord\(dynamicState\.workoutHistory, id\)/);
+  assert.match(source, /window\.confirm\(/);
 });

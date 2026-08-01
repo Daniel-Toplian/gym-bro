@@ -13,6 +13,8 @@ const YOUTUBE_EMBED_HOSTS = new Set(["youtube-nocookie.com", "www.youtube-nocook
 const YOUTUBE_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
 const IMAGE_PATH_PATTERN = /\.(?:avif|gif|jpe?g|png|webp)$/i;
 
+export const MAX_WEIGHT_KG = 1000;
+
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
@@ -90,6 +92,18 @@ export function validateData({ exercises, routines, schedule, defaults }) {
 
   exercises.forEach((exercise, index) => {
     assert(isNonEmptyString(exercise.name), `exercises[${index}].name must be a non-empty string`);
+    assert(
+      Array.isArray(exercise.bodyParts) && exercise.bodyParts.length > 0,
+      `exercises[${index}].bodyParts must be a non-empty array`,
+    );
+    assert(
+      exercise.bodyParts.every(isNonEmptyString),
+      `exercises[${index}].bodyParts must contain only non-empty strings`,
+    );
+    assert(
+      new Set(exercise.bodyParts).size === exercise.bodyParts.length,
+      `exercises[${index}].bodyParts must not repeat a body part`,
+    );
   });
 
   routines.forEach((routine, routineIndex) => {
@@ -110,6 +124,35 @@ export function validateData({ exercises, routines, schedule, defaults }) {
       assert(
         Number.isInteger(entry.restSeconds) && entry.restSeconds >= 0,
         `${path}.restSeconds must be a non-negative integer`,
+      );
+      assert(
+        entry.weightKg === undefined ||
+          (Number.isFinite(entry.weightKg) && entry.weightKg >= 0 && entry.weightKg <= MAX_WEIGHT_KG),
+        `${path}.weightKg must be a number between 0 and ${MAX_WEIGHT_KG}`,
+      );
+      assert(
+        entry.supersetGroup === undefined || isNonEmptyString(entry.supersetGroup),
+        `${path}.supersetGroup must be a non-empty string`,
+      );
+    });
+
+    const groups = new Map();
+    routine.exercises.forEach((entry, entryIndex) => {
+      if (entry.supersetGroup === undefined) return;
+      if (!groups.has(entry.supersetGroup)) groups.set(entry.supersetGroup, []);
+      groups.get(entry.supersetGroup).push(entryIndex);
+    });
+
+    groups.forEach((indexes, group) => {
+      const path = `routines[${routineIndex}] superset "${group}"`;
+      assert(indexes.length > 1, `${path} must contain at least two exercises`);
+      assert(
+        indexes.every((entryIndex, position) => entryIndex === indexes[0] + position),
+        `${path} must group consecutive exercises`,
+      );
+      assert(
+        indexes.every((entryIndex) => routine.exercises[entryIndex].sets === routine.exercises[indexes[0]].sets),
+        `${path} must declare the same number of sets for every exercise`,
       );
     });
   });
@@ -162,6 +205,21 @@ export function validateData({ exercises, routines, schedule, defaults }) {
     "defaults.activeWorkout.exerciseDurations must be an array",
   );
   assert(Array.isArray(defaults.workoutHistory), "defaults.workoutHistory must be an array");
+  assert(
+    Object.hasOwn(defaults, "freeTimer") && defaults.freeTimer === null,
+    "defaults.freeTimer must be null",
+  );
+  assert(
+    isPlainObject(defaults.dailyTotals) && Object.keys(defaults.dailyTotals).length === 0,
+    "defaults.dailyTotals must be an empty object",
+  );
+  assert(isPlainObject(defaults.trackerGoals), "defaults.trackerGoals must be an object");
+  ["calories", "protein", "waterMl"].forEach((field) => {
+    assert(
+      Number.isFinite(defaults.trackerGoals[field]) && defaults.trackerGoals[field] > 0,
+      `defaults.trackerGoals.${field} must be a positive number`,
+    );
+  });
 
   return { exercises, routines, schedule, defaults };
 }

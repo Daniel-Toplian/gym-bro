@@ -16,5 +16,12 @@
     "pausedAt": null,
     "rest": null
   },
-  "workoutHistory": []
+  "workoutHistory": [],
+  "freeTimer": null,
+  "dailyTotals": {},
+  "trackerGoals": {
+    "calories": 2200,
+    "protein": 150,
+    "waterMl": 3000
+  }
 }

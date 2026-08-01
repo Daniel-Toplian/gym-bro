@@ -12,6 +12,19 @@
         "exerciseId": "pull-up",
         "sets": 3,
         "restSeconds": 60
+      },
+      {
+        "exerciseId": "dips",
+        "sets": 3,
+        "restSeconds": 30,
+        "supersetGroup": "finisher"
+      },
+      {
+        "exerciseId": "squats",
+        "sets": 3,
+        "restSeconds": 90,
+        "weightKg": 60,
+        "supersetGroup": "finisher"
       }
     ]
   }
